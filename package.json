@@ -1,10 +1,12 @@
 {
 	"name": "pi-hyper-tools",
-	"version": "0.3.2",
+	"version": "0.3.3",
 	"description": "Enhanced Pi extension for Charm Hyper with dashboard, live rate limits, and usage analytics",
 	"license": "MIT",
 	"keywords": [
-		"pi-package"
+		"pi-package",
+		"hyper-charm",
+		"hyper"
 	],
 	"files": [
 		"src",
