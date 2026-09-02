@@ -13,7 +13,7 @@ This fork extends the official Hyper provider with an interactive `/hyper` termi
 # Install in Pi
 pi install git:github.com/samuelrubiodev/pi-hyper-tools
 
-# Install in OMP from npm
+# Install in Pi from npm
 pi install npm:pi-hyper-tools
 
 # Or install from local directory during development
