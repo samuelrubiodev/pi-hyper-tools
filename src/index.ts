@@ -25,6 +25,7 @@ import {
 import { HYPER_API_BASE_URL, HYPERCREDITS_PER_USD, PROVIDER_DISPLAY_NAME, PROVIDER_NAME } from "./hyper.js";
 import { fetchHyperModels, getCachedRawModel } from "./models.js";
 import { createNotifier } from "./notify.js";
+import { type HyperChatPayload, optimizeHyperPayload } from "./payload.js";
 import { createTracker, type Tracker } from "./tracking.js";
 
 type CreditStatusState =
@@ -139,9 +140,17 @@ export default function (pi: ExtensionAPI) {
 
 	const hyperApi: ProviderStreams = {
 		stream(model, context, options) {
+			const userOnPayload = options?.onPayload;
 			const userOnResponse = options?.onResponse;
 			const wrappedOptions: StreamOptions = {
 				...options,
+				onPayload: async (payload, m) => {
+					let p = payload;
+					if (userOnPayload) {
+						p = (await userOnPayload(p, m)) ?? p;
+					}
+					return optimizeHyperPayload(p as unknown as HyperChatPayload);
+				},
 				onResponse: async (response, m) => {
 					tracker.updateServerRateLimits(response.headers);
 					await userOnResponse?.(response, m);
@@ -150,9 +159,17 @@ export default function (pi: ExtensionAPI) {
 			return baseApi.stream(model, context, wrappedOptions);
 		},
 		streamSimple(model, context, options) {
+			const userOnPayload = options?.onPayload;
 			const userOnResponse = options?.onResponse;
 			const wrappedOptions: SimpleStreamOptions = {
 				...options,
+				onPayload: async (payload, m) => {
+					let p = payload;
+					if (userOnPayload) {
+						p = (await userOnPayload(p, m)) ?? p;
+					}
+					return optimizeHyperPayload(p as unknown as HyperChatPayload);
+				},
 				onResponse: async (response, m) => {
 					tracker.updateServerRateLimits(response.headers);
 					await userOnResponse?.(response, m);
@@ -329,6 +346,13 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		scheduleCreditStatusRefresh(ctx, event.model);
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_NAME) return;
+		if (event.payload && typeof event.payload === "object") {
+			return optimizeHyperPayload(event.payload as unknown as HyperChatPayload);
+		}
 	});
 
 	pi.on("after_provider_response", (event, _ctx) => {
