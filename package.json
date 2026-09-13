@@ -1,6 +1,6 @@
 {
 	"name": "pi-hyper-tools",
-	"version": "0.4.1",
+	"version": "0.4.2",
 	"description": "Enhanced Pi extension for Charm Hyper with dashboard, live rate limits, and usage analytics",
 	"license": "MIT",
 	"keywords": [
