@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
-import { HYPERCREDITS_PER_USD, hyperProviderDir } from "./hyper.js";
+import { HYPERCREDITS_PER_USD, hyperProviderDir, PROVIDER_NAME } from "./hyper.js";
 import { getCachedHyperModel, getCachedRawModel } from "./models.js";
 import type { WarningSink } from "./notify.js";
 import { parseSchema } from "./schema.js";
@@ -20,6 +20,7 @@ export interface RequestUsageData {
 }
 
 export interface InferenceRecord {
+	sessionId?: string;
 	timestamp: number;
 	model: string;
 	inputTokens: number;
@@ -100,6 +101,7 @@ export interface TrackingSummary {
 
 const InferenceRecordSchema = Type.Object(
 	{
+		sessionId: Type.Optional(Type.String()),
 		timestamp: Type.Number(),
 		model: Type.String(),
 		inputTokens: Type.Number(),
@@ -283,6 +285,7 @@ export function readUsageStore(filePath = defaultUsageFilePath(), warn?: Warning
 		const parsed = JSON.parse(raw);
 		const validated = parseSchema(UsageStoreValidator, parsed, "usage.json");
 		const normalizedRecords: InferenceRecord[] = validated.records.map((r) => ({
+			sessionId: r.sessionId,
 			timestamp: r.timestamp,
 			model: r.model,
 			inputTokens: r.inputTokens,
@@ -366,11 +369,17 @@ export interface TrackerOptions {
 }
 
 export interface Tracker {
-	recordRequest(params: { model: string; usage?: RequestUsageData; timestamp?: number }): InferenceRecord;
+	recordRequest(params: {
+		model: string;
+		usage?: RequestUsageData;
+		timestamp?: number;
+		sessionId?: string;
+	}): InferenceRecord;
 	updateServerRateLimits(headers: Record<string, string> | Headers | undefined): ServerRateLimits;
 	getServerRateLimits(): ServerRateLimits;
 	getSummary(now?: Date): TrackingSummary;
 	getSessionStats(): SessionUsageStats;
+	syncSessionFromEntries(entries: unknown[], sessionId?: string): SessionUsageStats;
 	resetSession(): void;
 	clearHistory(): void;
 }
@@ -451,7 +460,12 @@ export function createTracker(optionsOrWarn?: WarningSink | TrackerOptions): Tra
 		return { ...currentServerLimits };
 	}
 
-	function recordRequest(params: { model: string; usage?: RequestUsageData; timestamp?: number }): InferenceRecord {
+	function recordRequest(params: {
+		model: string;
+		usage?: RequestUsageData;
+		timestamp?: number;
+		sessionId?: string;
+	}): InferenceRecord {
 		const now = params.timestamp ?? Date.now();
 		const u = params.usage;
 		const inputTokens = u?.inputTokens ?? 0;
@@ -478,6 +492,7 @@ export function createTracker(optionsOrWarn?: WarningSink | TrackerOptions): Tra
 			u?.actualCostHc ?? (actualCostUsd !== undefined ? actualCostUsd * HYPERCREDITS_PER_USD : undefined);
 
 		const record: InferenceRecord = {
+			sessionId: params.sessionId,
 			timestamp: now,
 			model: params.model,
 			inputTokens,
@@ -584,6 +599,176 @@ export function createTracker(optionsOrWarn?: WarningSink | TrackerOptions): Tra
 		return { ...sessionStats };
 	}
 
+	function syncSessionFromEntries(entries: unknown[], sessionId?: string): SessionUsageStats {
+		let requests = 0;
+		let inputTokens = 0;
+		let cachedTokens = 0;
+		let cacheWriteTokens = 0;
+		let outputTokens = 0;
+		let reasoningTokens = 0;
+		let totalTokens = 0;
+		let costUsd = 0;
+		let costHc = 0;
+		let actualCostUsdTotal = 0;
+		let hasActualCostUsd = false;
+		let actualCostHcTotal = 0;
+		let hasActualCostHc = false;
+
+		if (Array.isArray(entries)) {
+			for (const entry of entries) {
+				if (!entry || typeof entry !== "object") continue;
+
+				let msg: Record<string, unknown> | null = null;
+				if ("type" in entry && (entry as Record<string, unknown>).type === "message" && "message" in entry) {
+					msg = (entry as Record<string, unknown>).message as Record<string, unknown>;
+				} else if ("role" in entry) {
+					msg = entry as Record<string, unknown>;
+				}
+
+				if (!msg || typeof msg !== "object" || msg.role !== "assistant") continue;
+
+				// Check provider or recognized model
+				const modelId =
+					typeof msg.responseModel === "string" ? msg.responseModel : typeof msg.model === "string" ? msg.model : "";
+				const isHyperProvider = msg.provider === PROVIDER_NAME;
+				const isRecognizedHyperModel = Boolean(modelId && (getCachedHyperModel(modelId) || getCachedRawModel(modelId)));
+
+				if (!isHyperProvider && !isRecognizedHyperModel) {
+					continue;
+				}
+
+				const rawUsage = msg.usage;
+				if (!rawUsage || typeof rawUsage !== "object") {
+					continue;
+				}
+				const u = rawUsage as Record<string, unknown>;
+
+				const inTok = typeof u.input === "number" ? u.input : 0;
+				const cReadTok = typeof u.cacheRead === "number" ? u.cacheRead : 0;
+				const cWriteTok = typeof u.cacheWrite === "number" ? u.cacheWrite : 0;
+				const outTok = typeof u.output === "number" ? u.output : 0;
+				const reasonTok = typeof u.reasoning === "number" ? u.reasoning : 0;
+				const totTok = typeof u.totalTokens === "number" ? u.totalTokens : inTok + cReadTok + cWriteTok + outTok;
+
+				// Skip empty / aborted zero-token turns
+				if (totTok === 0 && inTok === 0 && outTok === 0 && cReadTok === 0) {
+					continue;
+				}
+
+				const pricing = modelId ? resolveModelPricing(modelId) : undefined;
+				const calculated = calculateEstimatedCost(pricing, {
+					inputTokens: inTok,
+					cachedTokens: cReadTok,
+					cacheWriteTokens: cWriteTok,
+					outputTokens: outTok,
+				});
+
+				let estimatedCostUsd = calculated.costUsd;
+				let estimatedCostHc = calculated.costHc;
+
+				let actCostUsd: number | undefined;
+				let actCostHc: number | undefined;
+
+				const rawCost = u.cost;
+				if (
+					rawCost &&
+					typeof rawCost === "object" &&
+					typeof (rawCost as Record<string, unknown>).total === "number" &&
+					!Number.isNaN((rawCost as Record<string, unknown>).total)
+				) {
+					const totalCost = (rawCost as Record<string, unknown>).total as number;
+					actCostUsd = totalCost;
+					actCostHc = totalCost * HYPERCREDITS_PER_USD;
+					if (estimatedCostUsd === 0) {
+						estimatedCostUsd = totalCost;
+						estimatedCostHc = actCostHc;
+					}
+				}
+
+				requests += 1;
+				inputTokens += inTok;
+				cachedTokens += cReadTok;
+				cacheWriteTokens += cWriteTok;
+				outputTokens += outTok;
+				reasoningTokens += reasonTok;
+				totalTokens += totTok;
+				costUsd += estimatedCostUsd;
+				costHc += estimatedCostHc;
+
+				if (actCostUsd !== undefined) {
+					actualCostUsdTotal += actCostUsd;
+					hasActualCostUsd = true;
+				}
+				if (actCostHc !== undefined) {
+					actualCostHcTotal += actCostHc;
+					hasActualCostHc = true;
+				}
+			}
+		}
+
+		// Fallback: If no requests were found from entries, check usage.json for records with matching sessionId
+		if (requests === 0 && sessionId) {
+			const store = getStore();
+			for (const rec of store.records) {
+				if (rec.sessionId === sessionId) {
+					requests += 1;
+					inputTokens += rec.inputTokens;
+					cachedTokens += rec.cachedTokens;
+					cacheWriteTokens += rec.cacheWriteTokens;
+					outputTokens += rec.outputTokens;
+					reasoningTokens += rec.reasoningTokens;
+					totalTokens += rec.inputTokens + rec.cachedTokens + rec.cacheWriteTokens + rec.outputTokens;
+					costUsd += rec.costUsd;
+					costHc += rec.costHc;
+					if (rec.actualCostUsd !== undefined) {
+						actualCostUsdTotal += rec.actualCostUsd;
+						hasActualCostUsd = true;
+					}
+					if (rec.actualCostHc !== undefined) {
+						actualCostHcTotal += rec.actualCostHc;
+						hasActualCostHc = true;
+					}
+				}
+			}
+		} else if (!hasActualCostUsd && sessionId) {
+			// If entries didn't have actual cost recorded, check if usage.json records with sessionId have actual cost
+			const store = getStore();
+			let storeActualUsd = 0;
+			let storeActualHc = 0;
+			let foundActual = false;
+			for (const rec of store.records) {
+				if (rec.sessionId === sessionId && rec.actualCostUsd !== undefined) {
+					storeActualUsd += rec.actualCostUsd;
+					storeActualHc += rec.actualCostHc ?? rec.actualCostUsd * HYPERCREDITS_PER_USD;
+					foundActual = true;
+				}
+			}
+			if (foundActual) {
+				actualCostUsdTotal = storeActualUsd;
+				actualCostHcTotal = storeActualHc;
+				hasActualCostUsd = true;
+				hasActualCostHc = true;
+			}
+		}
+
+		sessionStats = {
+			requests,
+			inputTokens,
+			cachedTokens,
+			cacheWriteTokens,
+			outputTokens,
+			reasoningTokens,
+			totalTokens,
+			costUsd,
+			costHc,
+			actualCostUsd: hasActualCostUsd ? actualCostUsdTotal : undefined,
+			actualCostHc: hasActualCostHc ? actualCostHcTotal : undefined,
+			cacheHitRate: calculateCacheHitRate(cachedTokens, inputTokens),
+		};
+
+		return { ...sessionStats };
+	}
+
 	function resetSession(): void {
 		sessionStats = {
 			requests: 0,
@@ -616,6 +801,7 @@ export function createTracker(optionsOrWarn?: WarningSink | TrackerOptions): Tra
 		getServerRateLimits,
 		getSummary,
 		getSessionStats,
+		syncSessionFromEntries,
 		resetSession,
 		clearHistory,
 	};

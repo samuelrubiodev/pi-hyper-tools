@@ -125,6 +125,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		notifier.activate(ctx);
+		if (ctx.sessionManager) {
+			tracker.syncSessionFromEntries(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId());
+		}
 		if (ctx.hasUI && typeof ctx.ui.addAutocompleteProvider === "function") {
 			ctx.ui.addAutocompleteProvider((current) => createHyperAutocompleteProvider(current));
 		}
@@ -134,6 +137,18 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		scheduleCreditStatusRefresh(ctx, ctx.model);
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		if (ctx.sessionManager) {
+			tracker.syncSessionFromEntries(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId());
+		}
+	});
+
+	pi.on("session_compact", (_event, ctx) => {
+		if (ctx.sessionManager) {
+			tracker.syncSessionFromEntries(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId());
+		}
 	});
 
 	const baseApi = openAICompletionsApi();
@@ -217,6 +232,10 @@ export default function (pi: ExtensionAPI) {
 			const trimmed = args.trim();
 			const tokens = trimmed.split(/\s+/).filter(Boolean);
 			const subcommand = tokens[0]?.toLowerCase() ?? "";
+
+			if (ctx.sessionManager) {
+				tracker.syncSessionFromEntries(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId());
+			}
 
 			try {
 				const runtime = await loadCreditStatus();
@@ -366,6 +385,7 @@ export default function (pi: ExtensionAPI) {
 
 		const usage = event.message.usage;
 		tracker.recordRequest({
+			sessionId: ctx.sessionManager?.getSessionId(),
 			model: event.message.responseModel ?? event.message.model,
 			usage: usage
 				? {
@@ -392,6 +412,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		tracker.resetSession();
 		pendingCreditStatusRefresh = undefined;
 		if (creditStatusRefreshWork !== undefined) clearImmediate(creditStatusRefreshWork);
 		creditStatusRefreshWork = undefined;

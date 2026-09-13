@@ -198,4 +198,262 @@ describe("Dynamic Server Rate Limits & Local Request Tracking", () => {
 		assert.equal(summary.session.actualCostHc, 0.002);
 		assert.ok(summary.session.costUsd > 0);
 	});
+
+	it("Test 9: syncSessionFromEntries reconstructs session stats from SessionEntry array", () => {
+		const tracker = createTracker({ inMemory: true });
+
+		const entries = [
+			{
+				type: "message",
+				id: "msg-1",
+				parentId: null,
+				timestamp: "2026-09-13T09:40:00.000Z",
+				message: {
+					role: "user",
+					content: "Hello",
+				},
+			},
+			{
+				type: "message",
+				id: "msg-2",
+				parentId: "msg-1",
+				timestamp: "2026-09-13T09:40:05.000Z",
+				message: {
+					role: "assistant",
+					provider: "hyper",
+					model: "deepseek-v4-flash",
+					responseModel: "deepseek-v4-flash",
+					usage: {
+						input: 1000,
+						cacheRead: 9000,
+						cacheWrite: 0,
+						output: 500,
+						reasoning: 200,
+						totalTokens: 10500,
+						cost: {
+							input: 0.0002,
+							output: 0.0002,
+							total: 0.0005,
+						},
+					},
+				},
+			},
+			{
+				type: "message",
+				id: "msg-3",
+				parentId: "msg-2",
+				timestamp: "2026-09-13T09:41:00.000Z",
+				message: {
+					role: "assistant",
+					provider: "hyper",
+					model: "deepseek-v4-flash",
+					usage: {
+						input: 500,
+						cacheRead: 9500,
+						cacheWrite: 0,
+						output: 250,
+						reasoning: 100,
+						totalTokens: 10250,
+						cost: {
+							total: 0.0003,
+						},
+					},
+				},
+			},
+		];
+
+		const stats = tracker.syncSessionFromEntries(entries, "session-123");
+
+		assert.equal(stats.requests, 2);
+		assert.equal(stats.inputTokens, 1500);
+		assert.equal(stats.cachedTokens, 18500);
+		assert.equal(stats.outputTokens, 750);
+		assert.equal(stats.reasoningTokens, 300);
+		assert.equal(stats.totalTokens, 20750);
+		assert.equal(stats.actualCostUsd?.toFixed(4), "0.0008");
+		assert.equal(stats.actualCostHc?.toFixed(4), (0.0008 * 20).toFixed(4));
+		// Cache hit rate: 18500 / (18500 + 1500) = 18500 / 20000 = 0.925 (92.5%)
+		assert.equal(stats.cacheHitRate, 0.925);
+
+		// Verify getSummary().session matches
+		const summary = tracker.getSummary();
+		assert.equal(summary.session.requests, 2);
+		assert.equal(summary.session.totalTokens, 20750);
+		assert.equal(summary.session.cacheHitRate, 0.925);
+	});
+
+	it("Test 10: syncSessionFromEntries ignores zero-token aborted turns", () => {
+		const tracker = createTracker({ inMemory: true });
+
+		const entries = [
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "hyper",
+					model: "deepseek-v4-flash",
+					usage: {
+						input: 0,
+						cacheRead: 0,
+						output: 0,
+						totalTokens: 0,
+					},
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "hyper",
+					model: "deepseek-v4-flash",
+					usage: {
+						input: 100,
+						cacheRead: 200,
+						output: 50,
+						totalTokens: 350,
+					},
+				},
+			},
+		];
+
+		const stats = tracker.syncSessionFromEntries(entries);
+		assert.equal(stats.requests, 1);
+		assert.equal(stats.totalTokens, 350);
+	});
+
+	it("Test 11: syncSessionFromEntries ignores non-Hyper messages", () => {
+		const tracker = createTracker({ inMemory: true });
+
+		const entries = [
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "anthropic",
+					model: "claude-3-5-sonnet",
+					usage: {
+						input: 500,
+						output: 200,
+						totalTokens: 700,
+					},
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "openai",
+					model: "gpt-4o",
+					usage: {
+						input: 500,
+						output: 200,
+						totalTokens: 700,
+					},
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					provider: "hyper",
+					model: "deepseek-v4-flash",
+					usage: {
+						input: 300,
+						output: 100,
+						totalTokens: 400,
+					},
+				},
+			},
+		];
+
+		const stats = tracker.syncSessionFromEntries(entries);
+		assert.equal(stats.requests, 1);
+		assert.equal(stats.inputTokens, 300);
+		assert.equal(stats.outputTokens, 100);
+	});
+
+	it("Test 12: syncSessionFromEntries falls back to usage.json when entries is empty", () => {
+		const tmpFile = path.join(os.tmpdir(), `hyper-test-fallback-${Date.now()}.json`);
+		try {
+			const tracker = createTracker({ storagePath: tmpFile });
+
+			// Record requests belonging to session A and session B
+			tracker.recordRequest({
+				sessionId: "sess-A",
+				model: "deepseek-v4-flash",
+				usage: { inputTokens: 200, cachedTokens: 800, outputTokens: 100, costUsd: 0.0005 },
+			});
+			tracker.recordRequest({
+				sessionId: "sess-B",
+				model: "deepseek-v4-flash",
+				usage: { inputTokens: 50, cachedTokens: 0, outputTokens: 25, costUsd: 0.0001 },
+			});
+
+			// Re-create tracker pointing to same file (simulating restarting Pi next day)
+			const tracker2 = createTracker({ storagePath: tmpFile });
+			assert.equal(tracker2.getSessionStats().requests, 0);
+
+			// Sync session A with empty entries array
+			const statsA = tracker2.syncSessionFromEntries([], "sess-A");
+			assert.equal(statsA.requests, 1);
+			assert.equal(statsA.inputTokens, 200);
+			assert.equal(statsA.cachedTokens, 800);
+			assert.equal(statsA.outputTokens, 100);
+			assert.equal(statsA.actualCostUsd, 0.0005);
+
+			// Reset session
+			tracker2.resetSession();
+			assert.equal(tracker2.getSessionStats().requests, 0);
+		} finally {
+			if (fs.existsSync(tmpFile)) {
+				fs.unlinkSync(tmpFile);
+			}
+		}
+	});
+
+	it("Test 13: recordRequest persists sessionId and survives reload", () => {
+		const tmpFile = path.join(os.tmpdir(), `hyper-test-sessionid-${Date.now()}.json`);
+		try {
+			const tracker1 = createTracker({ storagePath: tmpFile });
+			tracker1.recordRequest({
+				sessionId: "my-custom-session-id",
+				model: "deepseek-v4-flash",
+				usage: { inputTokens: 100, cachedTokens: 0, outputTokens: 50 },
+			});
+
+			const tracker2 = createTracker({ storagePath: tmpFile });
+			const stats = tracker2.syncSessionFromEntries([], "my-custom-session-id");
+			assert.equal(stats.requests, 1);
+			const raw = JSON.parse(fs.readFileSync(tmpFile, "utf-8"));
+			assert.equal(raw.records.length, 1);
+			assert.equal(raw.records[0].sessionId, "my-custom-session-id");
+		} finally {
+			if (fs.existsSync(tmpFile)) {
+				fs.unlinkSync(tmpFile);
+			}
+		}
+	});
+
+	it("Test 14: syncSessionFromEntries parses real session file correctly if present", () => {
+		const sessionPath =
+			"/home/samuel/.pi/agent/sessions/--home-samuel-Documents-blender-HalconMilenarioDeepseekV4.1Flash--/2026-09-13T09-40-30-153Z_01a09a23-c348-75b8-8214-862ee23f4030.jsonl";
+		if (!fs.existsSync(sessionPath)) {
+			return; // Skip if file not present on this machine
+		}
+
+		const lines = fs.readFileSync(sessionPath, "utf-8").trim().split("\n");
+		const entries = lines.map((l) => JSON.parse(l));
+
+		const tracker = createTracker({ inMemory: true });
+		const stats = tracker.syncSessionFromEntries(entries, "01a09a23-c348-75b8-8214-862ee23f4030");
+
+		assert.equal(stats.requests, 103);
+		assert.equal(stats.inputTokens, 514815);
+		assert.equal(stats.cachedTokens, 11447694);
+		assert.equal(stats.outputTokens, 188634);
+		assert.equal(stats.reasoningTokens, 86491);
+		assert.equal(stats.totalTokens, 12151143);
+		assert.ok(stats.cacheHitRate > 0.95);
+		assert.ok((stats.actualCostHc ?? 0) > 14);
+	});
 });
